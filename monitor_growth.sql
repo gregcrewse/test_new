@@ -1,7 +1,7 @@
 -- models/monitoring/tagged_tables_growth_metrics.sql
 with current_snapshot as (
     select
-        current_timestamp() as snapshot_time,
+        snapshot_time,
         table_name,
         schema_name,
         row_count
@@ -33,7 +33,7 @@ growth_metrics as (
         row_count,
         lag(row_count) over (partition by table_name, schema_name order by snapshot_time) as previous_row_count,
         lag(snapshot_time) over (partition by table_name, schema_name order by snapshot_time) as previous_snapshot_time,
-        datediff('second', previous_snapshot_time, snapshot_time) as seconds_elapsed,
+        datediff(second, previous_snapshot_time, snapshot_time) as seconds_elapsed,
         (row_count - previous_row_count) as rows_added,
         (row_count - previous_row_count) / nullif(seconds_elapsed, 0) as rows_per_second
     from combined_snapshots
