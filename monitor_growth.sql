@@ -1,80 +1,57 @@
 -- models/monitoring/tagged_tables_growth_metrics.sql
-
-WITH 
-
--- Get metadata about all tables with specific tag
-tagged_tables AS (
-    {% for node in graph.nodes.values() %}
-        {% if node.resource_type == 'model' and node.config.get('tags', [])|select('equalto', 'your_monitoring_tag')|list|length > 0 %}
-            SELECT 
-                '{{ node.name }}' AS table_name,
-                '{{ node.schema }}' AS schema_name
-            {% if not loop.last %} UNION ALL {% endif %}
-        {% endif %}
-    {% endfor %}
+with current_snapshot as (
+    select
+        current_timestamp() as snapshot_time,
+        table_name,
+        schema_name,
+        row_count
+    from {{ ref('tagged_tables_snapshot_history') }}
+    where snapshot_time = (select max(snapshot_time) from {{ ref('tagged_tables_snapshot_history') }})
 ),
 
--- Get the current snapshot of table row counts
-current_snapshot AS (
-    {% for node in graph.nodes.values() %}
-        {% if node.resource_type == 'model' and node.config.get('tags', [])|select('equalto', 'your_monitoring_tag')|list|length > 0 %}
-            SELECT 
-                current_timestamp() AS snapshot_time,
-                '{{ node.name }}' AS table_name,
-                '{{ node.schema }}' AS schema_name,
-                (SELECT COUNT(*) FROM {{ ref(node.name) }}) AS row_count
-            {% if not loop.last %} UNION ALL {% endif %}
-        {% endif %}
-    {% endfor %}
-),
-
--- Historical snapshots from previous runs
-historical_snapshots AS (
-    SELECT 
+historical_snapshots as (
+    select 
         snapshot_time,
         table_name,
         schema_name,
         row_count
-    FROM {{ ref('tagged_tables_snapshot_history') }}
+    from {{ ref('tagged_tables_snapshot_history') }}
+    where snapshot_time < (select max(snapshot_time) from {{ ref('tagged_tables_snapshot_history') }})
 ),
 
--- Combine historical with current
-combined_snapshots AS (
-    SELECT * FROM historical_snapshots
-    UNION ALL
-    SELECT * FROM current_snapshot
+combined_snapshots as (
+    select * from historical_snapshots
+    union all
+    select * from current_snapshot
 ),
 
--- Calculate growth rates between snapshots
-growth_metrics AS (
-    SELECT
+growth_metrics as (
+    select
         snapshot_time,
         table_name,
         schema_name,
         row_count,
-        LAG(row_count) OVER (PARTITION BY table_name, schema_name ORDER BY snapshot_time) AS previous_row_count,
-        LAG(snapshot_time) OVER (PARTITION BY table_name, schema_name ORDER BY snapshot_time) AS previous_snapshot_time,
-        DATEDIFF('SECOND', previous_snapshot_time, snapshot_time) AS seconds_elapsed,
-        (row_count - previous_row_count) AS rows_added,
-        (row_count - previous_row_count) / NULLIF(seconds_elapsed, 0) AS rows_per_second
-    FROM combined_snapshots
+        lag(row_count) over (partition by table_name, schema_name order by snapshot_time) as previous_row_count,
+        lag(snapshot_time) over (partition by table_name, schema_name order by snapshot_time) as previous_snapshot_time,
+        datediff('second', previous_snapshot_time, snapshot_time) as seconds_elapsed,
+        (row_count - previous_row_count) as rows_added,
+        (row_count - previous_row_count) / nullif(seconds_elapsed, 0) as rows_per_second
+    from combined_snapshots
 ),
 
--- Calculate statistical thresholds based on historical patterns
-statistics AS (
-    SELECT
+statistics as (
+    select
         table_name,
         schema_name,
-        AVG(rows_per_second) AS avg_rows_per_second,
-        STDDEV(rows_per_second) AS stddev_rows_per_second
-    FROM growth_metrics
-    WHERE rows_per_second IS NOT NULL
-    GROUP BY 1, 2
+        avg(rows_per_second) as avg_rows_per_second,
+        stddev(rows_per_second) as stddev_rows_per_second
+    from growth_metrics
+    where rows_per_second is not null
+    group by 1, 2
 ),
 
--- Flag anomalies based on thresholds
-anomaly_detection AS (
-    SELECT
+anomaly_detection as (
+    select
         g.snapshot_time,
         g.table_name,
         g.schema_name,
@@ -84,21 +61,21 @@ anomaly_detection AS (
         g.rows_per_second,
         s.avg_rows_per_second,
         s.stddev_rows_per_second,
-        CASE
-            WHEN g.rows_per_second < (s.avg_rows_per_second - 3 * s.stddev_rows_per_second) 
-                THEN 'SEVERE_SLOWDOWN'
-            WHEN g.rows_per_second < (s.avg_rows_per_second - 2 * s.stddev_rows_per_second) 
-                THEN 'SLOWDOWN'
-            WHEN g.rows_per_second > (s.avg_rows_per_second + 3 * s.stddev_rows_per_second) 
-                THEN 'SEVERE_SPIKE'
-            WHEN g.rows_per_second > (s.avg_rows_per_second + 2 * s.stddev_rows_per_second) 
-                THEN 'SPIKE'
-            ELSE 'NORMAL'
-        END AS status
-    FROM growth_metrics g
-    JOIN statistics s ON g.table_name = s.table_name AND g.schema_name = s.schema_name
-    WHERE g.rows_per_second IS NOT NULL
+        case
+            when g.rows_per_second < (s.avg_rows_per_second - 3 * s.stddev_rows_per_second) 
+                then 'SEVERE_SLOWDOWN'
+            when g.rows_per_second < (s.avg_rows_per_second - 2 * s.stddev_rows_per_second) 
+                then 'SLOWDOWN'
+            when g.rows_per_second > (s.avg_rows_per_second + 3 * s.stddev_rows_per_second) 
+                then 'SEVERE_SPIKE'
+            when g.rows_per_second > (s.avg_rows_per_second + 2 * s.stddev_rows_per_second) 
+                then 'SPIKE'
+            else 'NORMAL'
+        end as status
+    from growth_metrics g
+    join statistics s on g.table_name = s.table_name and g.schema_name = s.schema_name
+    where g.rows_per_second is not null
 )
 
-SELECT * FROM anomaly_detection
-ORDER BY snapshot_time DESC, table_name
+select * from anomaly_detection
+order by snapshot_time desc, table_name
