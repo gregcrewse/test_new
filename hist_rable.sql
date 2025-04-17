@@ -1,23 +1,30 @@
 -- models/monitoring/tagged_tables_snapshot_history.sql
-
 {{ config(
     materialized='incremental',
     unique_key=['snapshot_time', 'table_name', 'schema_name']
 ) }}
 
--- Collect snapshots for all tagged tables
-{% for node in graph.nodes.values() %}
-    {% if node.resource_type == 'model' and node.config.get('tags', [])|select('equalto', 'your_monitoring_tag')|list|length > 0 %}
-        SELECT 
-            current_timestamp() AS snapshot_time,
-            '{{ node.name }}' AS table_name,
-            '{{ node.schema }}' AS schema_name,
-            (SELECT COUNT(*) FROM {{ ref(node.name) }}) AS row_count
-        {% if not loop.last %} UNION ALL {% endif %}
-    {% endif %}
-{% endfor %}
+with registry as (
+    select * from {{ ref('table_registry') }}
+),
+
+row_counts as (
+    {% for node in graph.nodes.values() %}
+        {% if node.resource_type == 'model' and node.config.get('tags', [])|select('equalto', 'your_monitoring_tag')|list|length > 0 %}
+            select
+                current_timestamp() as snapshot_time,
+                '{{ node.name }}' as table_name,
+                '{{ node.schema }}' as schema_name,
+                (select count(*) from {{ source(node.schema, node.name) if node.resource_type == 'source' else ref(node.name) }}) as row_count
+            from registry
+            where table_name = '{{ node.name }}' and schema_name = '{{ node.schema }}'
+            {% if not loop.last %} union all {% endif %}
+        {% endif %}
+    {% endfor %}
+)
+
+select * from row_counts
 
 {% if is_incremental() %}
-    -- Avoid duplicate snapshots within a short time period
-    WHERE snapshot_time > (SELECT MAX(snapshot_time) FROM {{ this }})
+where snapshot_time > (select max(snapshot_time) from {{ this }})
 {% endif %}
