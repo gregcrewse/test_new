@@ -4,31 +4,34 @@
     unique_key=['snapshot_time', 'table_name', 'schema_name']
 ) }}
 
--- All tag dependencies need to be listed explicitly here
-{%- set tagged_models_dependencies = [] -%}
-{%- for node in graph.nodes.values() -%}
-    {%- if node.resource_type == 'model' and node.config.get('tags', [])|select('equalto', 'your_monitoring_tag')|list|length > 0 -%}
-        {%- do tagged_models_dependencies.append(node.name) -%}
-    {%- endif -%}
-{%- endfor -%}
+-- Include explicit dependency to the list above
+{{ ref('explicit_dependency_list') }}
 
-{%- if execute -%}
-    {%- for dep in tagged_models_dependencies -%}
-    -- depends on: {{ ref(dep) }}
-    {%- endfor -%}
-{%- endif -%}
+with monitored_tables as (
+    select 
+        '{{ var("monitoring_table_1") }}' as table_name,
+        '{{ var("monitoring_schema_1") }}' as schema_name
+    union all
+    select 
+        '{{ var("monitoring_table_2") }}' as table_name,
+        '{{ var("monitoring_schema_2") }}' as schema_name
+    -- Add more tables as needed
+),
 
-with snapshot_data as (
-    {% for node in graph.nodes.values() %}
-        {% if node.resource_type == 'model' and node.config.get('tags', [])|select('equalto', 'your_monitoring_tag')|list|length > 0 %}
-            {% if not loop.first %}union all{% endif %}
-            select
-                getdate() as snapshot_time,
-                '{{ node.name }}' as table_name,
-                '{{ node.schema }}' as schema_name,
-                (select count(*) from {{ ref(node.name) }}) as row_count
-        {% endif %}
-    {% endfor %}
+snapshot_data as (
+    select
+        getdate() as snapshot_time,
+        m.table_name,
+        m.schema_name,
+        case
+            when m.table_name = '{{ var("monitoring_table_1") }}' then 
+                (select count(*) from {{ ref(var("monitoring_table_1")) }})
+            when m.table_name = '{{ var("monitoring_table_2") }}' then 
+                (select count(*) from {{ ref(var("monitoring_table_2")) }})
+            -- Add more cases as needed
+            else 0
+        end as row_count
+    from monitored_tables m
 )
 
 select * from snapshot_data
